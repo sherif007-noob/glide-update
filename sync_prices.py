@@ -6,7 +6,7 @@ from psycopg2.extras import execute_batch
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def run_sync():
-    # 1. Fetch EGX closing prices from TradingView
+    # 1. Fetch EGX prices from TradingView Scanner
     print("Fetching EGX closing prices...")
     tv_url = "https://scanner.tradingview.com/egypt/scan"
     payload = {
@@ -34,31 +34,45 @@ def run_sync():
 
     print(f"Retrieved prices for {len(price_map)} EGX stocks.")
 
-    # 2. Connect to Glide Postgres database
+    # 2. Connect to database
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # Identify exact table and column names
-    cur.execute("""
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-          AND (table_name ILIKE '%ticker%' OR table_name ILIKE '%directory%')
-        LIMIT 1;
-    """)
-    table_name = cur.fetchone()[0]
+    # Find table
+    cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
+    tables = [t[0] for t in cur.fetchall()]
+    table_name = next((t for t in tables if "ticker" in t.lower() or "directory" in t.lower()), None)
 
-    cur.execute("""
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_name = %s 
-          AND (column_name ILIKE '%current_price_egp%' OR column_name ILIKE '%price%')
-        LIMIT 1;
-    """, (table_name,))
-    
-    col_row = cur.fetchone()
-    price_col = col_row[0] if col_row else "current_price_egp"
-    print(f"Targeting table: '{table_name}', column: '{price_col}'")
+    if not table_name:
+        table_name = tables[0] if tables else None
+
+    if not table_name:
+        print("No tables found in database.")
+        return
+
+    # Find all columns safely in Python
+    cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s;", (table_name,))
+    columns = [col[0] for col in cur.fetchall()]
+    print(f"Found table: '{table_name}'")
+    print(f"Available columns: {columns}")
+
+    # Match the target price column
+    price_col = None
+    for c in columns:
+        if c.lower() == "current_price_egp":
+            price_col = c
+            break
+    if not price_col:
+        for c in columns:
+            if "price" in c.lower() or "current" in c.lower():
+                price_col = c
+                break
+
+    if not price_col:
+        print("Could not find a price column.")
+        return
+
+    print(f"Updating target column: '{price_col}'")
 
     # 3. Read tickers from Glide
     cur.execute(f'SELECT id, ticker FROM "{table_name}" WHERE ticker IS NOT NULL;')
