@@ -5,8 +5,21 @@ from psycopg2.extras import execute_batch
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Maps legacy, alternate, or renamed tickers to their active EGX scanner symbol
+TICKER_ALIASES = {
+    "QNBA": "QNBF",   # QNB Alahli
+    "MNHD": "MASR",   # Madinet Masr for Housing & Development
+    "AUTO": "GBCO",   # GB Corp
+    "OTMT": "OIH",    # Orascom Investment Holding
+    "COMI": "COMI",
+    "TMGH": "TMGH",
+    "SWDY": "SWDY",
+    "HRHO": "HRHO",
+    "ETEL": "ETEL",
+    "UBEG": "UBEE",   # United Bank
+}
+
 def run_sync():
-    # 1. Fetch EGX prices from TradingView Scanner
     print("Fetching EGX closing prices...")
     tv_url = "https://scanner.tradingview.com/egypt/scan"
     payload = {
@@ -34,64 +47,45 @@ def run_sync():
 
     print(f"Retrieved prices for {len(price_map)} EGX stocks.")
 
-    # 2. Connect to database
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # Find table
     cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
     tables = [t[0] for t in cur.fetchall()]
-    table_name = next((t for t in tables if "ticker" in t.lower() or "directory" in t.lower()), None)
+    table_name = next((t for t in tables if "ticker" in t.lower() or "directory" in t.lower()), tables[0])
 
-    if not table_name:
-        table_name = tables[0] if tables else None
-
-    if not table_name:
-        print("No tables found in database.")
-        return
-
-    # Find all columns safely in Python
     cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s;", (table_name,))
     columns = [col[0] for col in cur.fetchall()]
-    print(f"Found table: '{table_name}'")
-    print(f"Available columns: {columns}")
+    
+    price_col = "current_price_egp" if "current_price_egp" in columns else next(
+        (c for c in columns if "price" in c.lower() or "current" in c.lower()), None
+    )
 
-    # Match the target price column
-    price_col = None
-    for c in columns:
-        if c.lower() == "current_price_egp":
-            price_col = c
-            break
-    if not price_col:
-        for c in columns:
-            if "price" in c.lower() or "current" in c.lower():
-                price_col = c
-                break
-
-    if not price_col:
-        print("Could not find a price column.")
-        return
-
-    print(f"Updating target column: '{price_col}'")
-
-    # 3. Read tickers from Glide
     cur.execute(f'SELECT id, ticker FROM "{table_name}" WHERE ticker IS NOT NULL;')
     db_rows = cur.fetchall()
 
     updates = []
-    for row_id, ticker in db_rows:
-        sym = ticker.strip().upper()
-        if sym in price_map:
-            updates.append((price_map[sym], row_id))
+    unmatched = []
 
-    # 4. Commit updates
+    for row_id, raw_ticker in db_rows:
+        ticker = raw_ticker.strip().upper()
+        # Resolve alias if available, otherwise check raw symbol
+        lookup_symbol = TICKER_ALIASES.get(ticker, ticker)
+
+        if lookup_symbol in price_map:
+            updates.append((price_map[lookup_symbol], row_id))
+        else:
+            unmatched.append(ticker)
+
     if updates:
         update_query = f'UPDATE "{table_name}" SET "{price_col}" = %s WHERE id = %s;'
         execute_batch(cur, update_query, updates)
         conn.commit()
         print(f"Successfully updated {len(updates)} stock prices in Glide!")
-    else:
-        print("No matching tickers found to update.")
+
+    if unmatched:
+        print(f"\nUnmatched tickers ({len(unmatched)}):")
+        print(", ".join(sorted(unmatched)))
 
     cur.close()
     conn.close()
