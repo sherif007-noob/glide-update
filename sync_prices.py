@@ -1,15 +1,43 @@
 import os
+import requests
 import psycopg2
 from psycopg2.extras import execute_batch
-import yfinance as yf
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def run_sync():
+    # 1. Fetch Egyptian Exchange closing prices via TradingView Scanner
+    print("Fetching EGX closing prices...")
+    tv_url = "https://scanner.tradingview.com/egypt/scan"
+    payload = {
+        "filter": [],
+        "options": {"lang": "en"},
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": ["name", "close"],
+        "sort": {"sortBy": "name", "sortOrder": "asc"},
+        "range": [0, 400]
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
+    response = requests.post(tv_url, json=payload, headers=headers, timeout=20)
+    response.raise_for_status()
+    tv_data = response.json().get("data", [])
+
+    price_map = {}
+    for item in tv_data:
+        ticker = item["d"][0].strip().upper()
+        price = item["d"][1]
+        if price is not None:
+            price_map[ticker] = round(float(price), 2)
+
+    print(f"Retrieved prices for {len(price_map)} EGX stocks.")
+
+    # 2. Connect to database
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # Locate table name dynamically
     cur.execute("""
         SELECT table_name 
         FROM information_schema.tables 
@@ -23,39 +51,27 @@ def run_sync():
         return
 
     table_name = row[0]
-    print(f"Updating table: {table_name}")
+    print(f"Connected to table: {table_name}")
 
     cur.execute(f'SELECT id, ticker FROM "{table_name}" WHERE ticker IS NOT NULL;')
-    rows = cur.fetchall()
-    if not rows:
-        return
-
-    ticker_map = {r[1].strip(): r[0] for r in rows if r[1]}
-    yf_symbols = [f"{t}.CA" for t in ticker_map.keys()]
-
-    market_data = yf.download(yf_symbols, period="1d", interval="1d", group_by="ticker", progress=False)
+    db_rows = cur.fetchall()
 
     updates = []
-    for ticker, row_id in ticker_map.items():
-        sym = f"{ticker}.CA"
-        try:
-            if len(ticker_map) == 1:
-                price = market_data["Close"].iloc[-1]
-            else:
-                price = market_data[sym]["Close"].iloc[-1]
+    for row_id, ticker in db_rows:
+        sym = ticker.strip().upper()
+        if sym in price_map:
+            updates.append((price_map[sym], row_id))
+        else:
+            print(f"No price found for ticker: {sym}")
 
-            if price is not None and str(price) != "nan":
-                updates.append((round(float(price), 2), row_id))
-        except Exception as e:
-            print(f"Skipping {ticker}: {e}")
-
-    update_query = f'UPDATE "{table_name}" SET current_price = %s WHERE id = %s;'
-    execute_batch(cur, update_query, updates)
-    conn.commit()
+    if updates:
+        update_query = f'UPDATE "{table_name}" SET current_price = %s WHERE id = %s;'
+        execute_batch(cur, update_query, updates)
+        conn.commit()
 
     cur.close()
     conn.close()
-    print(f"Updated {len(updates)} records.")
+    print(f"Successfully updated {len(updates)} records in Glide!")
 
 if __name__ == "__main__":
     run_sync()
